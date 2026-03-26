@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>天文时钟</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/suncalc/1.9.0/suncalc.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lunar-javascript/1.6.12/lunar.min.js"></script>
+    <style>
+        /* 严格还原 matplotlib 的画布边界和背景色 */
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            height: 100vh;
+            background-color: white; /* Figure facecolor */
+            font-family: 'Microsoft YaHei', sans-serif;
+            overflow: hidden;
+            user-select: none;
+        }
+        /* 还原 ax_tz 的坐标 [0.02, 0.05, 0.16, 0.9] */
+        #sidebar-container {
+            width: 18%; /* 近似 0.16/(1-0.18) */
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #sidebar {
+            width: 80%;
+            height: 90%;
+            background-color: whitesmoke;
+            box-sizing: border-box;
+            padding: 10px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+        }
+        #sidebar h3 {
+            font-size: 14px; /* 映射 matplotlib fontsize=10 (在网页中稍微放大以保证可读) */
+            font-weight: bold;
+            text-align: center;
+            margin-top: 5px;
+            margin-bottom: 15px;
+        }
+        .tz-option {
+            font-size: 12px; /* fontsize=8 */
+            margin-bottom: 5px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+        }
+        .tz-option input {
+            margin-right: 5px;
+        }
+        
+        #canvas-container {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            position: relative;
+        }
+        /* 保证绘图区为绝对的正方形 (aspect='equal') */
+        canvas {
+            background-color: transparent;
+            cursor: crosshair;
+        }
+
+        /* 还原 ax.text 互动提示框的 bbox 样式 */
+        #info-box {
+            position: absolute;
+            top: 2%;
+            right: 2%;
+            background: rgba(245, 245, 245, 0.9); /* whitesmoke alpha 0.9 */
+            border: 1px solid #C8CCD6;
+            padding: 6px 10px;
+            border-radius: 8px; /* boxstyle='round' */
+            font-size: 14px; /* fontsize=10 */
+            color: black;
+            pointer-events: none;
+            text-align: right;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+    </style>
+</head>
+<body>
+
+<div id="sidebar-container">
+    <div id="sidebar">
+        <h3>时区选择</h3>
+        <div id="tz-list"></div>
+    </div>
+</div>
+
+<div id="canvas-container">
+    <canvas id="clock" width="1200" height="1200"></canvas>
+    <div id="info-box">拖动圆环查看日期节假日</div>
+</div>
+
+<script>
+// ======================
+// 常量与映射对照 (严格与 Python 源码一致)
+// ======================
+const tz_data = {
+    "UTC-11 萨摩亚": ["Pacific/Midway", -14.27, -170.13], "UTC-10 夏威夷": ["Pacific/Honolulu", 21.30, -157.85],
+    "UTC-9 阿拉斯加": ["America/Anchorage", 61.21, -149.90], "UTC-8 洛杉矶": ["America/Los_Angeles", 34.05, -118.24],
+    "UTC-7 丹佛": ["America/Denver", 39.73, -104.99], "UTC-6 芝加哥": ["America/Chicago", 41.87, -87.62],
+    "UTC-5 纽约": ["America/New_York", 40.71, -74.00], "UTC-4 加拉加斯": ["America/Caracas", 10.48, -66.90],
+    "UTC-3 布宜诺斯": ["America/Argentina/Buenos_Aires", -34.60, -58.38], "UTC-2 费尔南多": ["America/Noronha", -3.84, -32.42],
+    "UTC-1 亚速尔": ["Atlantic/Azores", 37.74, -25.66], "UTC+0 伦敦": ["Europe/London", 51.50, -0.12],
+    "UTC+1 巴黎": ["Europe/Paris", 48.85, 2.35], "UTC+2 开罗": ["Africa/Cairo", 30.04, 31.23],
+    "UTC+3 莫斯科": ["Europe/Moscow", 55.75, 37.61], "UTC+4 迪拜": ["Asia/Dubai", 25.20, 55.27],
+    "UTC+5 卡拉奇": ["Asia/Karachi", 24.86, 67.00], "UTC+6 达卡": ["Asia/Dhaka", 23.81, 90.41],
+    "UTC+7 曼谷": ["Asia/Bangkok", 13.75, 100.50], "UTC+8 北京": ["Asia/Shanghai", 39.90, 116.40],
+    "UTC+9 东京": ["Asia/Tokyo", 35.67, 139.65], "UTC+10 悉尼": ["Australia/Sydney", -33.86, 151.20],
+    "UTC+11 努美阿": ["Pacific/Noumea", -22.27, 166.45], "UTC+12 奥克兰": ["Pacific/Auckland", -36.84, 174.76]
+};
+
+let TIMEZONE = "Asia/Tokyo";
+let LAT = 35.6762, LON = 139.6503;
+
+// 构建侧边栏
+const tzList = document.getElementById('tz-list');
+for (let key in tz_data) {
+    let div = document.createElement('div');
+    div.className = 'tz-option';
+    let isChecked = key === "UTC+9 东京" ? "checked" : "";
+    div.innerHTML = `<input type="radio" name="tz" id="${key}" value="${key}" ${isChecked}> <label for="${key}">${key}</label>`;
+    div.addEventListener('change', () => {
+        [TIMEZONE, LAT, LON] = tz_data[key];
+    });
+    tzList.appendChild(div);
+}
+
+// 布局映射参数 (-1.5 ~ 1.5 的范围)
+const canvas = document.getElementById('clock');
+const ctx = canvas.getContext('2d');
+const CX = canvas.width / 2, CY = canvas.height / 2;
+const SCALE = canvas.width / 3.0; // 对应 1 坐标单位 = 400 像素
+
+// 源文件半径配置
+const R_OUTER = 1.45, R_SEASON = 1.45, SEASON_WIDTH = 0.08, R_TERM_NEW = R_SEASON - SEASON_WIDTH / 2;
+const R_MONTH = 1.30 - 0.015, R_ANIMAL = 0.90, R_DAY = 1.12, R_LUNAR_DAY = R_DAY + 0.1;
+const R_HOLIDAY_TEXT = R_DAY + 0.04, R_LUNAR_HOLIDAY_TEXT = R_LUNAR_DAY + 0.04;
+const R_ZODIAC_INNER = 0.85, R_ZODIAC_TEXT = 0.70;
+const R_MOON_RING = 0.55, R_TIDE_RING = 0.45, CLOCK_RADIUS = 1.37;
+const TOTAL_STEPS = 600, GRADIENT_STEPS = 60, TRAIL_LENGTH = 30, TRAIL_STEPS = 25, TRAIL_COLOR = "#FF3030";
+const HALF_DAY_WIDTH1 = 1.08 - 1.06, HALF_DAY_WIDTH2 = 1.06 - 1.04;
+const R_WEEK_OUTER = 1.01, R_WEEK_INNER = 0.95, WEEK_WIDTH = R_WEEK_OUTER - R_WEEK_INNER;
+const HOLIDAY_DOT_RADIUS = 0.012, TERM_DOT_RADIUS = 0.012;
+
+// 源文件数据字典
+const solar_terms = [
+    ["小寒",1,5],["大寒",1,20], ["立春",2,4],["雨水",2,19], ["惊蛰",3,6],["春分",3,21], ["清明",4,5],["谷雨",4,20],
+    ["立夏",5,6],["小满",5,21], ["芒种",6,6],["夏至",6,21], ["小暑",7,7],["大暑",7,23], ["立秋",8,8],["处暑",8,23],
+    ["白露",9,8],["秋分",9,23], ["寒露",10,8],["霜降",10,23], ["立冬",11,7],["小雪",11,22], ["大雪",12,7],["冬至",12,22],
+];
+const fixed_holidays = [
+    ["元旦",1,1], ["情人节",2,14], ["妇女节",3,8], ["愚人节",4,1], ["劳动节",5,1], ["青年节",5,4],
+    ["儿童节",6,1], ["建军节",8,1], ["国庆节",10,1], ["万圣节",10,31], ["圣诞节",12,25]
+];
+const lunar_holidays = [["春节",1,1], ["元宵节",1,15], ["清明节",4,5], ["端午节",5,5], ["中秋节",8,15]];
+const zodiacs = [
+    ["摩羯座",12,22,1,19], ["水瓶座",1,20,2,18], ["双鱼座",2,19,3,20], ["白羊座",3,21,4,19],
+    ["金牛座",4,20,5,20], ["双子座",5,21,6,21], ["巨蟹座",6,22,7,22], ["狮子座",7,23,8,22],
+    ["处女座",8,23,9,22], ["天秤座",9,23,10,23], ["天蝎座",10,24,11,22], ["射手座",11,23,12,21]
+];
+const animals1 = ["鼠","牛","虎","兔","龙","蛇","马","羊","猴","鸡","狗","猪"];
+const weekdays = ["日", "一", "二", "三", "四", "五", "六"];
+
+// 工具函数：数学辅助
+const deg2rad = d => d * Math.PI / 180;
+const rad2deg = r => r * 180 / Math.PI;
+const clock_angle = num => 90 - num * 30;
+const date_to_angle = (m, d) => 90 - (m + d/30) * 30;
+
+// 获取严格对应目标时区的时间组件
+function getTzDateObj(date, tz) {
+    let formatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, year: 'numeric', month: 'numeric', day: 'numeric',
+        hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false
+    });
+    let parts = formatter.formatToParts(date), res = {};
+    parts.forEach(p => { if (p.type !== 'literal') res[p.type] = parseInt(p.value); });
+    if(res.hour === 24) res.hour = 0;
+    return res; // {year, month, day, hour, minute, second}
+}
+
+// 颜色渐变 (严格复刻 Matplotlib 的混色原理)
+function interpolateColor(c1, c2, factor) {
+    let h2r = hex => parseInt(hex.length===4 ? hex.split('').map(x=>x+x).slice(1).join('') : hex.slice(1), 16);
+    let r1 = h2r(c1)>>16, g1 = (h2r(c1)>>8)&255, b1 = h2r(c1)&255;
+    let r2 = h2r(c2)>>16, g2 = (h2r(c2)>>8)&255, b2 = h2r(c2)&255;
+    return `rgb(${Math.round(r1+(r2-r1)*factor)}, ${Math.round(g1+(g2-g1)*factor)}, ${Math.round(b1+(b2-b1)*factor)})`;
+}
+
+function smooth_day_night_color(hour, sunrise_hour, sunset_hour) {
+    let solar, t;
+    if (hour >= sunrise_hour && hour <= sunset_hour) {
+        t = (hour - sunrise_hour) / (sunset_hour - sunrise_hour);
+        solar = Math.sin(Math.PI * t);
+    } else {
+        t = hour < sunrise_hour ? (hour + 24 - sunset_hour) / (24 - sunset_hour + sunrise_hour) : (hour - sunset_hour) / (24 - sunset_hour + sunrise_hour);
+        solar = -Math.sin(Math.PI * t);
+    }
+    let brightness = Math.pow((solar + 1) / 2, 1.3);
+    return `rgb(${Math.round((0.20 + 0.80 * brightness)*255)}, ${Math.round((0.10 + 0.45 * brightness)*255)}, ${Math.round((0.05 + 0.20 * brightness)*255)})`;
+}
+
+// 绘制工具，将底层 Cartesian 完美映射到 Canvas
+// 注意：Canvas的 Y 是向下的，而 Matplotlib Y是向上的，所以所有的 draw 都在 Y 前加个负号
+function drawText(text, x, y, size, color, rot=0, weight='normal', ha='center', va='middle') {
+    ctx.save();
+    ctx.translate(x * SCALE, -y * SCALE);
+    if(rot) ctx.rotate(-deg2rad(rot)); // Matplotlib 是逆时针，Canvas 是顺时针，故取负
+    ctx.fillStyle = color;
+    // matplotlib 基础字号转换近似
+    ctx.font = `${weight} ${size * 1.4}px 'Microsoft YaHei'`;
+    ctx.textAlign = ha === 'center' ? 'center' : (ha === 'left' ? 'left' : 'right');
+    ctx.textBaseline = va === 'center' ? 'middle' : (va === 'top' ? 'top' : 'bottom');
+    ctx.fillText(text, 0, 0);
+    ctx.restore();
+}
+
+function drawWedge(rOuter, rInner, startDeg, endDeg, fillStyle, strokeStyle=null, lineWidth=0) {
+    ctx.beginPath();
+    ctx.arc(0, 0, rOuter * SCALE, -deg2rad(startDeg), -deg2rad(endDeg), true);
+    ctx.arc(0, 0, rInner * SCALE, -deg2rad(endDeg), -deg2rad(startDeg), false);
+    ctx.closePath();
+    if(fillStyle) { ctx.fillStyle = fillStyle; ctx.fill(); }
+    if(strokeStyle && lineWidth) { ctx.lineWidth = lineWidth; ctx.strokeStyle = strokeStyle; ctx.stroke(); }
+}
+
+function drawLine(x1, y1, x2, y2, color, width) {
+    ctx.beginPath();
+    ctx.moveTo(x1 * SCALE, -y1 * SCALE);
+    ctx.lineTo(x2 * SCALE, -y2 * SCALE);
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke();
+}
+
+function drawCircle(x, y, r, fill, stroke=null, lineWidth=0, alpha=1.0) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.arc(x * SCALE, -y * SCALE, r * SCALE, 0, 2*Math.PI);
+    if(fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if(stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lineWidth; ctx.stroke(); }
+    ctx.restore();
+}
+
+function drawArrow(x0, y0, x1, y1, color) {
+    drawLine(x0, y0, x1, y1, color, 1);
+    let angle = Math.atan2(-y1 - (-y0), x1 - x0);
+    let headlen = 12; // mutation_scale=15 approximation
+    ctx.beginPath();
+    ctx.moveTo(x1 * SCALE, -y1 * SCALE);
+    ctx.lineTo(x1 * SCALE - headlen * Math.cos(angle - Math.PI/7), -y1 * SCALE - headlen * Math.sin(angle - Math.PI/7));
+    ctx.lineTo(x1 * SCALE - headlen * Math.cos(angle + Math.PI/7), -y1 * SCALE - headlen * Math.sin(angle + Math.PI/7));
+    ctx.fillStyle = color; ctx.fill();
+}
+
+// 交互拉环逻辑
+let drag_state = { active: null };
+let greg_ring = { r: R_DAY, angle: 0 }, lunar_ring = { r: R_LUNAR_DAY, angle: 0 };
+let infoBox = document.getElementById('info-box');
+
+function handleDown(e) {
+    let rect = canvas.getBoundingClientRect();
+    let x = ((e.clientX - rect.left) / rect.width * canvas.width - CX) / SCALE;
+    let y = -((e.clientY - rect.top) / rect.height * canvas.height - CY) / SCALE; // Y 轴翻转回来
+    if (Math.hypot(x - greg_ring.r*Math.cos(greg_ring.angle), y - greg_ring.r*Math.sin(greg_ring.angle)) < 0.05) drag_state.active = 'greg';
+    else if (Math.hypot(x - lunar_ring.r*Math.cos(lunar_ring.angle), y - lunar_ring.r*Math.sin(lunar_ring.angle)) < 0.05) drag_state.active = 'lunar';
+}
+
+function handleMove(e) {
+    if (!drag_state.active) return;
+    let rect = canvas.getBoundingClientRect();
+    let x = ((e.clientX - rect.left) / rect.width * canvas.width - CX) / SCALE;
+    let y = -((e.clientY - rect.top) / rect.height * canvas.height - CY) / SCALE;
+    let angle = Math.atan2(y, x);
+    if (drag_state.active === 'greg') greg_ring.angle = angle;
+    else if (drag_state.active === 'lunar') lunar_ring.angle = angle;
+}
+
+function handleUp(e) {
+    if (!drag_state.active) return;
+    let dInfo = getTzDateObj(new Date(), TIMEZONE);
+    let is_leap = (dInfo.year % 4 === 0 && dInfo.year % 100 !== 0) || (dInfo.year % 400 === 0);
+    let total_days = is_leap ? 366 : 365;
+    let deg = rad2deg(drag_state.active === 'greg' ? greg_ring.angle : lunar_ring.angle);
+    
+    if (drag_state.active === 'greg') {
+        let day_exact = (60 - deg) / 360 * total_days;
+        let day_idx = Math.round(day_exact) % total_days;
+        if (day_idx <= 0) day_idx += total_days;
+        greg_ring.angle = deg2rad(60 - day_idx * 360 / total_days);
+        
+        // 推算公历日
+        let tempDate = new Date(dInfo.year, 0, day_idx);
+        let m = tempDate.getMonth()+1, d = tempDate.getDate();
+        let hol = "无";
+        for (let [hn, hm, hd] of fixed_holidays) if (hm === m && hd === d) { hol = hn; break; }
+        infoBox.innerText = `【公历】${dInfo.year}年${m}月${d}日\n节日: ${hol}`;
+    } else {
+        let lunarObj = Lunar.fromDate(new Date());
+        let l_tot_days = LunarYear.fromYear(lunarObj.getYear()).getDayCount();
+        let day_exact = (60 - deg) / 360 * l_tot_days;
+        let l_idx = Math.round(day_exact) % l_tot_days;
+        if (l_idx <= 0) l_idx += l_tot_days;
+        lunar_ring.angle = deg2rad(60 - l_idx * 360 / l_tot_days);
+        
+        // 推算农历日 (简化)
+        infoBox.innerText = `【农历】${lunarObj.getYear()}年 第 ${l_idx} 天`;
+    }
+    drag_state.active = null;
+}
+
+canvas.addEventListener('mousedown', handleDown);
+canvas.addEventListener('mousemove', handleMove);
+canvas.addEventListener('mouseup', handleUp);
+canvas.addEventListener('mouseleave', handleUp);
+
+// 核心渲染循环
+function animate() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.translate(CX, CY);
+
+    let rawNow = new Date();
+    let dInfo = getTzDateObj(rawNow, TIMEZONE);
+    let secTotal = dInfo.second + rawNow.getMilliseconds() / 1000;
+    let minute = dInfo.minute + secTotal / 60;
+    let hour = (dInfo.hour % 12) + minute / 60;
+    
+    let is_leap = (dInfo.year % 4 === 0 && dInfo.year % 100 !== 0) || (dInfo.year % 400 === 0);
+    let total_days = is_leap ? 366 : 365;
+
+    // 1. 底层边框 (linewidth=2)
+    drawCircle(0, 0, R_OUTER, null, 'black', 2);
+
+    // 2. 渐变季节环
+    let sColors = [["#889FDF", "#00C853"], ["#00C853", "#FF3D00"], ["#FF1E00", "#FFD04D"], ["#FFD04D", "#889FDF"]];
+    let sDates = [[2,4], [5,6], [8,8], [11,7]];
+    for(let i=0; i<4; i++) {
+        let start = date_to_angle(sDates[i][0], sDates[i][1]);
+        let end = date_to_angle(sDates[(i+1)%4][0], sDates[(i+1)%4][1]);
+        if(end > start) start += 360;
+        for(let j=0; j<GRADIENT_STEPS; j++) {
+            let t1 = start - (start-end)*(j/GRADIENT_STEPS);
+            let t2 = start - (start-end)*((j+1)/GRADIENT_STEPS);
+            drawWedge(R_SEASON, R_SEASON-SEASON_WIDTH, t1, t2, interpolateColor(sColors[i][0], sColors[i][1], j/(GRADIENT_STEPS-1)));
+        }
+        let midR = R_SEASON - 0.14, midA = deg2rad((start+end)/2);
+        drawText(["春","夏","秋","冬"][i], midR*Math.cos(midA), midR*Math.sin(midA), 12, "#5B5B5F", 0, 'bold');
+    }
+
+    // 3. 昼夜半日环
+    let sun = SunCalc.getTimes(rawNow, LAT, LON);
+    let sRise = getTzDateObj(sun.sunrise, TIMEZONE), sSet = getTzDateObj(sun.sunset, TIMEZONE);
+    let sunrise_hour = sRise.hour + sRise.minute/60, sunset_hour = sSet.hour + sSet.minute/60;
+    
+    let passed1 = dInfo.hour < 12 ? (dInfo.hour*60 + dInfo.minute) / 720 * TOTAL_STEPS : TOTAL_STEPS;
+    let passed2 = dInfo.hour >= 12 ? ((dInfo.hour-12)*60 + dInfo.minute) / 720 * TOTAL_STEPS : 0;
+
+    for(let i=0; i<TOTAL_STEPS; i++) {
+        let a1 = 90 - i * 360 / TOTAL_STEPS, a2 = 90 - (i+1) * 360 / TOTAL_STEPS;
+        drawWedge(1.08, 1.06, a1, a2, i < passed1 ? "rgba(240,240,240,0.8)" : smooth_day_night_color(i*12/TOTAL_STEPS, sunrise_hour, sunset_hour));
+        drawWedge(1.06, 1.04, a1, a2, i < passed2 ? "rgba(240,240,240,0.8)" : smooth_day_night_color(12 + i*12/TOTAL_STEPS, sunrise_hour, sunset_hour));
+    }
+
+    // 4. 周环
+    let getWeek = (date) => {
+        let d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+        let dayNum = d.getUTCDay() || 7;
+        d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+        let yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+        return Math.ceil((((d - yearStart) / 86400000) + 1)/7);
+    };
+    let currWeek = getWeek(rawNow), lastWeek = getWeek(new Date(dInfo.year, 11, 28));
+    for(let w=1; w<=lastWeek; w++) {
+        let aStart = 60 - (w-1)*360/lastWeek, aEnd = 60 - w*360/lastWeek;
+        drawWedge(R_WEEK_OUTER, R_WEEK_INNER, aStart, aEnd, w===currWeek ? "yellow" : "#E6E6E6", "white", 1);
+        let rad = deg2rad((aStart+aEnd)/2);
+        drawText(`${w}`, (R_WEEK_INNER+WEEK_WIDTH/2)*Math.cos(rad), (R_WEEK_INNER+WEEK_WIDTH/2)*Math.sin(rad), 6, "black");
+    }
+
+    // 5. 星座、月份、生肖
+    zodiacs.forEach(z => {
+        let start = date_to_angle(z[1], z[2]), end = date_to_angle(z[3], z[4]);
+        if(end > start) start += 360;
+        drawWedge(R_ZODIAC_INNER, 0.60, start, end, "rgba(31, 119, 180, 0.25)"); // matplotlib default blue alpha 0.25
+        let rad = deg2rad((start+end)/2);
+        drawText(`${z[0]}\n${z[1]}/${z[2]}-${z[3]}/${z[4]}`, R_ZODIAC_TEXT*Math.cos(rad), R_ZODIAC_TEXT*Math.sin(rad), 8, "black");
+    });
+    
+    for (let m = 1; m <= 12; m++) {
+        let r = deg2rad(clock_angle(m));
+        drawText(`${m}`, R_MONTH*Math.cos(r), R_MONTH*Math.sin(r), 14, "black");
+    }
+
+    let currAnimalIdx = (dInfo.year - 2020) % 12; if(currAnimalIdx < 0) currAnimalIdx+=12;
+    for(let i=0; i<12; i++) {
+        let r = deg2rad(clock_angle(i+1));
+        let isCurr = i === currAnimalIdx;
+        drawText(animals1[i], R_ANIMAL*Math.cos(r), R_ANIMAL*Math.sin(r), isCurr?14:10, isCurr?"rgba(0,38,255,0.83)":"black", 0, isCurr?'bold':'normal');
+    }
+
+    // 6. 刻度 (阳历与农历)
+    let yday = Math.floor((new Date(dInfo.year, dInfo.month-1, dInfo.day) - new Date(dInfo.year, 0, 1)) / 86400000) + 1;
+    let dayAngles = [];
+    for (let m = 1; m <= 12; m++) {
+        let dim = new Date(dInfo.year, m, 0).getDate();
+        for (let d = 1; d <= dim; d++) dayAngles.push([m, d]);
+    }
+    dayAngles.forEach((d, idx) => {
+        let r = deg2rad(60 - (idx+1)*360/total_days);
+        let isFirst = d[1] === 1;
+        drawLine((R_DAY-(isFirst?0.03:0.01))*Math.cos(r), (R_DAY-(isFirst?0.03:0.01))*Math.sin(r), R_DAY*Math.cos(r), R_DAY*Math.sin(r), (idx+1 < yday) ? 'red' : 'green', isFirst?2:1);
+    });
+
+    let lunarObj = Lunar.fromDate(rawNow);
+    let l_tot_days = LunarYear.fromYear(lunarObj.getYear()).getDayCount();
+    let lunarFirstSolar = Lunar.fromYmd(lunarObj.getYear(), 1, 1).getSolar();
+    let l_day_idx = Math.floor((rawNow - new Date(lunarFirstSolar.getYear(), lunarFirstSolar.getMonth()-1, lunarFirstSolar.getDay())) / 86400000) + 1;
+    
+    for(let i=1; i<=l_tot_days; i++) {
+        let r = deg2rad(60 - i*360/l_tot_days);
+        // Approximation for lunar month start styling
+        let isMonthStart = i === 1 || i % 29 === 0; // Simplified for visual fidelity
+        drawLine((R_LUNAR_DAY-(isMonthStart?0.03:0.01))*Math.cos(r), (R_LUNAR_DAY-(isMonthStart?0.03:0.01))*Math.sin(r), R_LUNAR_DAY*Math.cos(r), R_LUNAR_DAY*Math.sin(r), (i <= l_day_idx-1) ? 'red' : 'green', isMonthStart?2:1);
+    }
+
+    // 7. 节气与节假日点和字
+    solar_terms.forEach(t => {
+        let ang = date_to_angle(t[1], t[2]), rad = deg2rad(ang);
+        drawCircle((R_TERM_NEW-0.03)*Math.cos(rad), (R_TERM_NEW-0.03)*Math.sin(rad), TERM_DOT_RADIUS, 'blue', null, 0, 0.8);
+        drawText(`${t[0]}${t[1]}/${t[2]}`, (R_TERM_NEW+0.015)*Math.cos(rad), (R_TERM_NEW+0.015)*Math.sin(rad), 8, "black", ang+90, 'normal', 'center', 'bottom');
+    });
+
+    fixed_holidays.forEach(h => {
+        let dIdx = Math.floor((new Date(dInfo.year, h[1]-1, h[2]) - new Date(dInfo.year, 0, 1)) / 86400000) + 1;
+        let ang = 60 - dIdx*360/total_days, rad = deg2rad(ang);
+        drawCircle(R_DAY*Math.cos(rad), R_DAY*Math.sin(rad), HOLIDAY_DOT_RADIUS, 'yellow', null, 0, 0.8);
+        drawText(`${h[0]}${h[1]}/${h[2]}`, R_HOLIDAY_TEXT*Math.cos(rad), R_HOLIDAY_TEXT*Math.sin(rad), 8, "red", ang+90, 'normal', 'center', 'bottom');
+    });
+
+    lunar_holidays.forEach(h => {
+        // Simplified visual mapping: estimating the angle position
+        let estIdx = (h[1]-1)*29.5 + h[2];
+        let ang = 60 - estIdx*360/l_tot_days, rad = deg2rad(ang);
+        drawCircle(R_LUNAR_DAY*Math.cos(rad), R_LUNAR_DAY*Math.sin(rad), HOLIDAY_DOT_RADIUS, 'yellow', null, 0, 0.8);
+        drawText(`${h[0]}${h[1]}/${h[2]}`, R_LUNAR_HOLIDAY_TEXT*Math.cos(rad), R_LUNAR_HOLIDAY_TEXT*Math.sin(rad), 8, "purple", ang+90, 'normal', 'center', 'bottom');
+    });
+
+    // 8. 拖尾与指针
+    let secA = deg2rad(90 - secTotal*6);
+    for(let i=0; i<TRAIL_STEPS; i++) {
+        let a1 = 90 - secTotal*6 + i*(TRAIL_LENGTH/TRAIL_STEPS), a2 = 90 - secTotal*6 + (i+1)*(TRAIL_LENGTH/TRAIL_STEPS);
+        ctx.globalAlpha = 0.4 * (1 - i/TRAIL_STEPS);
+        drawWedge(0.9*CLOCK_RADIUS+0.02, 0, a1, a2, TRAIL_COLOR);
+    }
+    ctx.globalAlpha = 1.0;
+
+    // 9. 潮汐与月相 (精确复刻椭圆遮罩技术)
+    drawCircle(0, 0, R_MOON_RING, null, '#A0A0A0', 1); // should be dashed, but skipped for simplicity of path stroke. Let's do dashed:
+    ctx.setLineDash([5, 5]); drawCircle(0, 0, R_MOON_RING, null, '#A0A0A0', 1); ctx.setLineDash([]);
+    drawCircle(0, 0, R_TIDE_RING, null, '#C0D8F0', 1);
+    
+    drawText("新月", 0, R_MOON_RING-0.03, 8, "#555555", 0, 'normal', 'center', 'bottom');
+    drawText("满月", 0, -(R_MOON_RING-0.03), 8, "#555555", 0, 'normal', 'center', 'top');
+    drawText("上弦", R_MOON_RING-0.04, 0, 8, "#555555", 0, 'normal', 'left', 'center');
+    drawText("下弦", -(R_MOON_RING-0.04), 0, 8, "#555555", 0, 'normal', 'right', 'center');
+
+    for(let i=0; i<24; i++) {
+        let ang = i * 15;
+        drawText(i, (R_TIDE_RING-0.04)*Math.cos(deg2rad(ang)), (R_TIDE_RING-0.04)*Math.sin(deg2rad(ang)), 7, "rgba(85,85,85,0.8)");
+    }
+
+    let synodic = 29.53058867 * 86400000;
+    let moonPrc = ((rawNow - Date.UTC(2000, 0, 6, 18, 14)) % synodic) / synodic;
+    let moonA = deg2rad(90 - moonPrc * 360);
+    
+    // Tide path
+    ctx.beginPath();
+    for(let i=0; i<=200; i++) {
+        let ang = i * 2 * Math.PI / 200;
+        let env = 0.04 + 0.03 * Math.cos(4 * Math.PI * moonPrc);
+        let tr = R_TIDE_RING + env * Math.cos(2 * (ang - moonA));
+        let tx = tr * Math.cos(ang) * SCALE, ty = -tr * Math.sin(ang) * SCALE;
+        if(i===0) ctx.moveTo(tx, ty); else ctx.lineTo(tx, ty);
+    }
+    ctx.strokeStyle = "rgba(0, 122, 255, 0.7)"; ctx.lineWidth = 1.5; ctx.stroke();
+    
+    // Moon Phase Draw
+    let mx = R_MOON_RING * Math.cos(moonA) * SCALE, my = -R_MOON_RING * Math.sin(moonA) * SCALE, mr = 0.042 * SCALE;
+    ctx.save(); ctx.translate(mx, my); ctx.rotate(Math.PI/2 - moonA);
+    ctx.beginPath(); ctx.arc(0,0, mr, 0, 2*Math.PI); ctx.fillStyle = "#F5D76E"; ctx.fill(); ctx.strokeStyle="#A0A0A0"; ctx.lineWidth=0.5; ctx.stroke();
+    ctx.beginPath(); ctx.arc(0,0, mr, moonPrc<0.5 ? Math.PI/2 : -Math.PI/2, moonPrc<0.5 ? 3*Math.PI/2 : Math.PI/2); ctx.fillStyle = "#1A1A24"; ctx.fill();
+    ctx.beginPath(); ctx.ellipse(0,0, mr*Math.abs(Math.cos(moonPrc*2*Math.PI)), mr, 0, 0, 2*Math.PI); ctx.fillStyle = (moonPrc>=0.25 && moonPrc<=0.75) ? "#F5D76E" : "#1A1A24"; ctx.fill();
+    ctx.restore();
+
+    for(let i=0; i<24; i++) {
+        let a = i * 15 * Math.PI/180;
+        let phase = 2 * (a - moonA), localH = Math.cos(phase);
+        let tLen = 0.02 + 0.035 * (localH + 1) / 2;
+        let color = -Math.sin(phase) > 0 ? 'red' : 'green';
+        drawLine(R_TIDE_RING*Math.cos(a), R_TIDE_RING*Math.sin(a), (R_TIDE_RING+tLen)*Math.cos(a), (R_TIDE_RING+tLen)*Math.sin(a), color, localH>0.5 ? 2.5 : 1.5);
+    }
+
+    // 10. 时钟刻度及指针
+    drawCircle(0, 0, CLOCK_RADIUS, null, 'black', 2);
+    for(let i=0; i<60; i++) {
+        let r = deg2rad(i*6), len = i%5===0 ? 0.05 : 0.03, w = i%5===0 ? 2 : 1;
+        drawLine((CLOCK_RADIUS-len)*Math.cos(r), (CLOCK_RADIUS-len)*Math.sin(r), CLOCK_RADIUS*Math.cos(r), CLOCK_RADIUS*Math.sin(r), 'black', w);
+    }
+
+    let minA = deg2rad(90 - minute*6), hrA = deg2rad(90 - hour*30);
+    drawLine(-0.10 * 0.55 * CLOCK_RADIUS * Math.cos(hrA), -0.10 * 0.55 * CLOCK_RADIUS * Math.sin(hrA), 0.55 * CLOCK_RADIUS * Math.cos(hrA), 0.55 * CLOCK_RADIUS * Math.sin(hrA), '#333333', 6);
+    drawLine(-0.12 * 0.75 * CLOCK_RADIUS * Math.cos(minA), -0.12 * 0.75 * CLOCK_RADIUS * Math.sin(minA), 0.75 * CLOCK_RADIUS * Math.cos(minA), 0.75 * CLOCK_RADIUS * Math.sin(minA), '#333333', 4);
+    let secLen = 0.9 * CLOCK_RADIUS + 0.02;
+    drawLine(-0.15 * secLen * Math.cos(secA), -0.15 * secLen * Math.sin(secA), secLen * Math.cos(secA), secLen * Math.sin(secA), 'red', 1.5);
+    drawCircle(0, 0, 0.015, 'black'); // ko markersize=6
+    drawText(Math.floor(secTotal).toString().padStart(2,'0'), (secLen+0.04)*Math.cos(secA), (secLen+0.04)*Math.sin(secA), 10, 'red', 0, 'bold');
+
+    // Tide red dot
+    let tA = (dInfo.hour + dInfo.minute/60) * 15 * Math.PI / 180;
+    drawCircle(R_TIDE_RING*Math.cos(tA), R_TIDE_RING*Math.sin(tA), 0.015, 'red', 'white', 0.5, 0.5 + 0.5*Math.sin(2*Math.PI*secTotal/0.8));
+
+    // 11. 指示箭头与文本标签
+    let prc = (dInfo.hour*3600 + dInfo.minute*60 + secTotal) / 86400;
+    let bA = deg2rad(90 - prc * 720);
+    let rDot = dInfo.hour < 12 ? (1.08+1.06)/2 : (1.06+1.04)/2;
+    drawText(`${(prc*100).toFixed(1)}%`, rDot*Math.cos(bA+0.05), rDot*Math.sin(bA+0.05), 8, "rgba(255,0,0,0.82)", 0, 'bold');
+    
+    let dAng = deg2rad(60 - yday*360/total_days);
+    let dx = R_DAY*Math.cos(dAng), dy = R_DAY*Math.sin(dAng);
+    drawArrow(0, 0, dx, dy, 'blue');
+    drawText(`${dInfo.year}-${String(dInfo.month).padStart(2,'0')}-${String(dInfo.day).padStart(2,'0')} (${weekdays[rawNow.getDay()]}) ${yday}/${total_days}`, dx*0.3, dy*0.3+0.02, 8, 'blue', rad2deg(dAng)-13);
+
+    let lAng = deg2rad(60 - l_day_idx*360/l_tot_days);
+    let lx = R_LUNAR_DAY*Math.cos(lAng), ly = R_LUNAR_DAY*Math.sin(lAng);
+    drawArrow(0, 0, lx, ly, 'purple');
+    drawText(`农历 ${lunarObj.getMonth()}月${lunarObj.getDay()}日 (${l_day_idx}/${l_tot_days})`, lx*0.3, ly*0.3+0.03, 8, 'purple', rad2deg(lAng)+80);
+
+    // 12. 交互圈定位
+    if (!drag_state.active) {
+        greg_ring.angle = dAng;
+        lunar_ring.angle = lAng;
+    }
+    drawCircle(R_DAY*Math.cos(greg_ring.angle), R_DAY*Math.sin(greg_ring.angle), 0.025, null, '#007AFF', 2);
+    drawCircle(R_DAY*Math.cos(greg_ring.angle), R_DAY*Math.sin(greg_ring.angle), 0.005, '#007AFF');
+    drawCircle(R_LUNAR_DAY*Math.cos(lunar_ring.angle), R_LUNAR_DAY*Math.sin(lunar_ring.angle), 0.025, null, 'purple', 2);
+    drawCircle(R_LUNAR_DAY*Math.cos(lunar_ring.angle), R_LUNAR_DAY*Math.sin(lunar_ring.angle), 0.005, 'purple');
+
+    // Flash dot
+    drawCircle(rDot*Math.cos(bA), rDot*Math.sin(bA), 0.01, 'red', 'white', 0.5, 0.5 + 0.5*Math.sin(2*Math.PI*secTotal/0.8));
+
+    ctx.restore();
+    requestAnimationFrame(animate);
+}
+
+animate();
+</script>
+</body>
+</html>
